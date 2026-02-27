@@ -63,20 +63,20 @@ def get_neighborhood(lat, lon):
 
 def fetch_permits():
     """Fetch recent commercial permits from Seattle Open Data."""
-    # Seattle Building Permits dataset
-    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
-    
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+
     url = "https://data.seattle.gov/resource/76t5-zqzr.json"
     params = {
-        "$where": f"application_date >= '{yesterday}'",
+        "$where": f"application_date >= '{cutoff}'",
         "$limit": 200,
         "$order": "application_date DESC",
+        "$select": "permit_num,permit_type,category,description,address,application_date,estproject_value,latitude,longitude,applicant_company_name",
     }
-    
+
     try:
         r = requests.get(url, params=params, timeout=30)
         if not r.ok:
-            print(f"  Permits API returned {r.status_code}")
+            print(f"  Permits API returned {r.status_code}: {r.text[:200]}")
             return []
         permits = r.json()
         print(f"Fetched {len(permits)} permits from Seattle Open Data")
