@@ -166,7 +166,6 @@ def save_to_airtable(permit, analysis, neighborhood):
             "Neighborhoods": neighborhood,
             "Week": get_week_key(),
             "ingestion_timestamp": datetime.now(timezone.utc).isoformat(),
-            "source_type": "permit",
         }, "typecast": True},
         timeout=15
     )
