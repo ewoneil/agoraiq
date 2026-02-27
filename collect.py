@@ -67,12 +67,20 @@ def fetch_reddit_posts():
     all_posts = []
     seen = set()
 
+    # Use a realistic browser User-Agent to avoid 403s from GitHub Actions IPs
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     for sub in subreddits:
         try:
             url = f"https://www.reddit.com/r/{sub}/search.json?q={requests.utils.quote(query)}&sort=new&limit=25&raw_json=1"
-            r = requests.get(url, headers={"User-Agent": "AgoraIQ/1.0"}, timeout=15)
+            r = requests.get(url, headers=headers, timeout=15)
             if not r.ok:
                 print(f"  Reddit r/{sub} returned {r.status_code}")
+                # Try pushshift as fallback
                 continue
             posts = r.json().get("data", {}).get("children", [])
             for p in posts:
@@ -89,9 +97,38 @@ def fetch_reddit_posts():
                     "comments": d.get("num_comments", 0),
                     "subreddit": d.get("subreddit", ""),
                 })
-            time.sleep(0.5)
+            time.sleep(1)
         except Exception as e:
             print(f"  Reddit error ({sub}): {e}")
+
+    # If Reddit blocked us, try corsproxy as fallback
+    if len(all_posts) == 0:
+        print("  Reddit direct blocked — trying proxy fallback...")
+        for sub in subreddits:
+            try:
+                reddit_url = f"https://www.reddit.com/r/{sub}/search.json?q={requests.utils.quote(query)}&sort=new&limit=25&raw_json=1"
+                proxy_url = f"https://corsproxy.io/?{requests.utils.quote(reddit_url)}"
+                r = requests.get(proxy_url, headers={"Accept": "application/json"}, timeout=20)
+                if not r.ok:
+                    continue
+                posts = r.json().get("data", {}).get("children", [])
+                for p in posts:
+                    d = p["data"]
+                    if d["id"] in seen:
+                        continue
+                    seen.add(d["id"])
+                    all_posts.append({
+                        "id": d["id"],
+                        "title": d.get("title", ""),
+                        "description": (d.get("selftext") or d.get("title", ""))[:800],
+                        "url": f"https://www.reddit.com{d['permalink']}",
+                        "date": datetime.fromtimestamp(d["created_utc"], tz=timezone.utc).isoformat(),
+                        "comments": d.get("num_comments", 0),
+                        "subreddit": d.get("subreddit", ""),
+                    })
+                time.sleep(1)
+            except Exception as e:
+                print(f"  Proxy error ({sub}): {e}")
 
     print(f"Fetched {len(all_posts)} posts from Reddit")
     return all_posts
