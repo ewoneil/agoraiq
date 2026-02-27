@@ -170,7 +170,7 @@ def save_to_airtable(permit, analysis, neighborhood):
         timeout=15
     )
     if not r.ok:
-        raise Exception(f"Airtable error: {r.status_code}")
+        raise Exception(f"Airtable error: {r.status_code}: {r.text[:300]}")
 
 def run():
     print(f"\n=== AgoraIQ Permit Collection — {datetime.now(timezone.utc).isoformat()} ===")
