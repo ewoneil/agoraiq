@@ -50,10 +50,9 @@ def fetch_permits():
     cutoff = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
     url = "https://data.seattle.gov/resource/76t5-zqzr.json"
     params = {
-    "$where": f"applicationdate >= '{cutoff}'",
-    "$limit": 200,
-    "$order": "applicationdate DESC",
-    "$select": "permitnum,permitclass,permittypedesc,description,originaladdress1,applicationdate,estprojectcost,latitude,longitude",
+    "$limit": 100,
+    "$order": "permitnum DESC",
+    "$select": "permitnum,permitclass,permittypedesc,description,originaladdress1,estprojectcost,latitude,longitude",
 }
     try:
         r = requests.get(url, params=params, timeout=30)
@@ -157,7 +156,7 @@ def save_to_airtable(permit, analysis, neighborhood):
         f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_RAW}",
         headers={"Authorization": f"Bearer {AIRTABLE_KEY}", "Content-Type": "application/json"},
         json={"fields": {
-            "Date": permit.get("applicationdate") or datetime.now(timezone.utc).isoformat(),
+            "Date": datetime.now(timezone.utc).isoformat(),
             "Raw Signal": f"[PERMIT] {permit_type} at {address} — {description[:300]} (Value: ${value})",
             "Category": analysis["category"],
             "Sentiment": analysis["sentiment"],
