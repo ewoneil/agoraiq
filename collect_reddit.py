@@ -151,7 +151,10 @@ Return ONLY valid JSON:
         raise Exception(f"Claude API error: {r.status_code}")
 
     text = r.json()["content"][0]["text"].replace("```json", "").replace("```", "").strip()
-    result = json.loads(text)
+    # Find JSON object in response
+    start = text.find('{')
+    end = text.rfind('}') + 1
+    result = json.loads(text[start:end])
     if result.get("neighborhood"):
         result["neighborhood"] = normalize_neighborhood(result["neighborhood"])
     return result
