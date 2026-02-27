@@ -10,7 +10,6 @@ AIRTABLE_KEY  = os.environ["AIRTABLE_KEY"]
 AIRTABLE_BASE = "appsxLPHnrJga3fGc"
 AIRTABLE_RAW  = "tbl6fFhubzyXgpv2K"
 
-# Seattle neighborhood bounding boxes for filtering permits by location
 NEIGHBORHOOD_ZONES = {
     "Capitol Hill":       (47.608, 47.625, -122.330, -122.300),
     "Ballard":            (47.655, 47.675, -122.395, -122.360),
@@ -33,25 +32,11 @@ NEIGHBORHOOD_ZONES = {
     "Madison Valley":     (47.618, 47.632, -122.305, -122.285),
 }
 
-# Permit types we care about — commercially relevant only
-COMMERCIAL_PERMIT_TYPES = {
-    "BLD": "Building Permit",
-    "ADDITION": "Building Addition",
-    "CHANGE OF USE": "Change of Use",
-    "DEMOLITION": "Demolition",
-    "SIGN": "Sign Permit",
-    "TENANT IMPROVEMENT": "Tenant Improvement",
-    "NEW": "New Construction",
-    "MECHANICAL": "Mechanical",
-    "ELECTRICAL": "Electrical",
-}
-
 def get_week_key():
     now = datetime.now(timezone.utc)
     return f"{now.year}-W{now.isocalendar()[1]:02d}"
 
 def get_neighborhood(lat, lon):
-    """Map lat/lon to neighborhood name."""
     try:
         lat, lon = float(lat), float(lon)
         for name, (lat_min, lat_max, lon_min, lon_max) in NEIGHBORHOOD_ZONES.items():
@@ -62,17 +47,14 @@ def get_neighborhood(lat, lon):
     return None
 
 def fetch_permits():
-    """Fetch recent commercial permits from Seattle Open Data."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
-
     url = "https://data.seattle.gov/resource/76t5-zqzr.json"
     params = {
-        "$where": f"application_date >= '{cutoff}'",
+        "$where": f"statusdate >= '{cutoff}'",
         "$limit": 200,
-        "$order": "application_date DESC",
-        "$select": "permit_num,permit_type,category,description,address,application_date,estproject_value,latitude,longitude,applicant_company_name",
+        "$order": "statusdate DESC",
+        "$select": "permitnum,permitclass,permittypedesc,description,originaladdress1,statusdate,estprojectcost,latitude,longitude",
     }
-
     try:
         r = requests.get(url, params=params, timeout=30)
         if not r.ok:
@@ -86,53 +68,40 @@ def fetch_permits():
         return []
 
 def is_commercial(permit):
-    """Filter for commercially relevant permits only."""
-    permit_type = (permit.get("permit_type") or permit.get("work_type") or "").upper()
-    category = (permit.get("category") or "").upper()
-    description = (permit.get("description") or permit.get("action_type") or "").upper()
-    value = float(permit.get("permit_value") or permit.get("estproject_value") or 0)
+    permit_class = (permit.get("permitclass") or "").upper()
+    permit_type = (permit.get("permittypedesc") or "").upper()
+    description = (permit.get("description") or "").upper()
+    value = float(permit.get("estprojectcost") or 0)
 
-    # Skip pure residential unless large development
-    if "SINGLE FAMILY" in category and value < 500000:
+    if "SINGLE FAMILY" in permit_class and value < 500000:
         return False
-    if "DUPLEX" in category and value < 500000:
+    if "DUPLEX" in permit_class and value < 500000:
         return False
 
-    # Keep anything with commercial indicators
     commercial_keywords = [
         "COMMERCIAL", "RETAIL", "RESTAURANT", "BAR", "TAVERN", "CAFE",
         "OFFICE", "MIXED USE", "MULTIFAMILY", "APARTMENT", "CONDO",
         "TENANT IMPROVEMENT", "CHANGE OF USE", "SIGN", "DEMOLITION",
-        "NEW CONSTRUCTION", "ADDITION"
+        "NEW CONSTRUCTION", "ADDITION", "INSTITUTION", "INDUSTRIAL"
     ]
-    
-    text = f"{permit_type} {category} {description}"
+    text = f"{permit_class} {permit_type} {description}"
     return any(kw in text for kw in commercial_keywords) or value > 100000
 
 def analyze_with_claude(permit, neighborhood):
-    """Use Claude to extract commercial signal from permit data."""
-    permit_type = permit.get("permit_type") or permit.get("work_type") or "Unknown"
-    description = permit.get("description") or permit.get("action_type") or ""
-    address = permit.get("address") or ""
-    value = permit.get("permit_value") or permit.get("estproject_value") or "Unknown"
-    category = permit.get("category") or ""
-    applicant = permit.get("applicant_name") or permit.get("contractor_company_name") or ""
-
     prompt = f"""You are a commercial real estate signal analyst for AgoraIQ.
 
 Analyze this Seattle building permit and extract the commercial signal.
 
-Permit Type: {permit_type}
-Category: {category}
-Description: {description}
-Address: {address}
-Estimated Value: ${value}
-Applicant/Contractor: {applicant}
+Permit Type: {permit.get("permittypedesc", "")}
+Class: {permit.get("permitclass", "")}
+Description: {permit.get("description", "")}
+Address: {permit.get("originaladdress1", "")}
+Estimated Value: ${permit.get("estprojectcost", "Unknown")}
 Neighborhood: {neighborhood}
 
 VALID CATEGORIES (pick one):
 - Business Opening
-- Business Closure  
+- Business Closure
 - Retail
 - Food & Drink
 - Housing & Development
@@ -160,12 +129,11 @@ Return ONLY valid JSON:
     )
     if not r.ok:
         raise Exception(f"Claude error: {r.status_code}")
-
     text = r.json()["content"][0]["text"].replace("```json", "").replace("```", "").strip()
     return json.loads(text)
 
-def already_saved(permit_url):
-    formula = f'{{Source URL}}="{permit_url}"'
+def already_saved(source_url):
+    formula = f'{{Source URL}}="{source_url}"'
     try:
         r = requests.get(
             f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_RAW}",
@@ -178,18 +146,19 @@ def already_saved(permit_url):
         return False
 
 def save_to_airtable(permit, analysis, neighborhood):
-    permit_id = permit.get("permit_num") or permit.get("application_permit_number") or ""
-    source_url = f"https://data.seattle.gov/resource/76t5-zqzr.json?permit_num={permit_id}"
-    address = permit.get("address") or ""
-    value = permit.get("permit_value") or permit.get("estproject_value") or ""
-    description = permit.get("description") or permit.get("action_type") or ""
+    permit_id = permit.get("permitnum") or ""
+    source_url = f"https://data.seattle.gov/resource/76t5-zqzr.json?permitnum={permit_id}"
+    address = permit.get("originaladdress1") or ""
+    value = permit.get("estprojectcost") or ""
+    description = permit.get("description") or ""
+    permit_type = permit.get("permittypedesc") or ""
 
     r = requests.post(
         f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_RAW}",
         headers={"Authorization": f"Bearer {AIRTABLE_KEY}", "Content-Type": "application/json"},
         json={"fields": {
-            "Date": permit.get("application_date") or datetime.now(timezone.utc).isoformat(),
-            "Raw Signal": f"[PERMIT] {permit.get('permit_type','')} at {address} — {description} (Value: ${value})",
+            "Date": permit.get("statusdate") or datetime.now(timezone.utc).isoformat(),
+            "Raw Signal": f"[PERMIT] {permit_type} at {address} — {description[:300]} (Value: ${value})",
             "Category": analysis["category"],
             "Sentiment": analysis["sentiment"],
             "Intent Summary": analysis["summary"],
@@ -218,9 +187,8 @@ def run():
 
     for permit in permits:
         try:
-            # Get coordinates
-            lat = permit.get("latitude") or permit.get("lat")
-            lon = permit.get("longitude") or permit.get("lon") or permit.get("long")
+            lat = permit.get("latitude")
+            lon = permit.get("longitude")
             neighborhood = get_neighborhood(lat, lon)
 
             if not neighborhood:
@@ -231,8 +199,8 @@ def run():
                 filtered += 1
                 continue
 
-            permit_id = permit.get("permit_num") or permit.get("application_permit_number") or ""
-            source_url = f"https://data.seattle.gov/resource/76t5-zqzr.json?permit_num={permit_id}"
+            permit_id = permit.get("permitnum") or ""
+            source_url = f"https://data.seattle.gov/resource/76t5-zqzr.json?permitnum={permit_id}"
 
             if already_saved(source_url):
                 skipped += 1
