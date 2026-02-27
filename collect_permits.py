@@ -50,10 +50,11 @@ def fetch_permits():
     cutoff = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
     url = "https://data.seattle.gov/resource/76t5-zqzr.json"
     params = {
-    "$limit": 100,
-    "$order": "permitnum DESC",
-    "$select": "permitnum,permitclass,permittypedesc,description,originaladdress1,estprojectcost,latitude,longitude",
-}
+        "$where": f"statusdate >= '{cutoff}'",
+        "$limit": 200,
+        "$order": "statusdate DESC",
+        "$select": "permitnum,permitclass,permittypedesc,description,originaladdress1,statusdate,estprojectcost,latitude,longitude",
+    }
     try:
         r = requests.get(url, params=params, timeout=30)
         if not r.ok:
@@ -156,21 +157,22 @@ def save_to_airtable(permit, analysis, neighborhood):
         f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_RAW}",
         headers={"Authorization": f"Bearer {AIRTABLE_KEY}", "Content-Type": "application/json"},
         json={"fields": {
-            "Date": datetime.now(timezone.utc).isoformat(),
+            "Date": permit.get("statusdate") or datetime.now(timezone.utc).isoformat(),
             "Raw Signal": f"[PERMIT] {permit_type} at {address} — {description[:300]} (Value: ${value})",
             "Category": analysis["category"],
             "Sentiment": analysis["sentiment"],
             "Intent Summary": analysis["summary"],
             "Forward Signal": analysis.get("forward_signal", ""),
             "Source URL": source_url,
-            "Neighborhoods": neighborhood,
+            "Neighborhood": neighborhood,
             "Week": get_week_key(),
             "ingestion_timestamp": datetime.now(timezone.utc).isoformat(),
+            "source_type": "permit",
         }, "typecast": True},
         timeout=15
     )
     if not r.ok:
-        raise Exception(f"Airtable error: {r.status_code}: {r.text[:300]}")
+        raise Exception(f"Airtable error: {r.status_code}")
 
 def run():
     print(f"\n=== AgoraIQ Permit Collection — {datetime.now(timezone.utc).isoformat()} ===")
