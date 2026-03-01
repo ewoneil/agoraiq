@@ -50,10 +50,10 @@ def fetch_permits():
     cutoff = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
     url = "https://data.seattle.gov/resource/76t5-zqzr.json"
     params = {
-        "$where": f"issuedate >= '{cutoff}'",
+        "$where": f"issueddate >= '{cutoff}'",
         "$limit": 200,
-        "$order": "issuedate DESC",
-        "$select": "permitnum,permitclass,permittypedesc,description,originaladdress1,issuedate,estprojectcost,latitude,longitude",
+        "$order": "issueddate DESC",
+        "$select": "permitnum,permitclass,permittypedesc,description,originaladdress1,issueddate,estprojectcost,latitude,longitude",
     }
     try:
         r = requests.get(url, params=params, timeout=30)
@@ -129,8 +129,10 @@ Return ONLY valid JSON:
     )
     if not r.ok:
         raise Exception(f"Claude error: {r.status_code}")
-    text = r.json()["content"][0]["text"].replace("```json", "").replace("```", "").strip()
-    return json.loads(text)
+    text = r.json()["content"][0]["text"]
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    return json.loads(text[start:end])
 
 def already_saved(source_url):
     formula = f'{{Source URL}}="{source_url}"'
@@ -157,7 +159,7 @@ def save_to_airtable(permit, analysis, neighborhood):
         f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_RAW}",
         headers={"Authorization": f"Bearer {AIRTABLE_KEY}", "Content-Type": "application/json"},
         json={"fields": {
-            "Date": permit.get("issuedate") or datetime.now(timezone.utc).isoformat(),
+            "Date": permit.get("issueddate") or datetime.now(timezone.utc).isoformat(),
             "Raw Signal": f"[PERMIT] {permit_type} at {address} — {description[:300]} (Value: ${value})",
             "Category": analysis["category"],
             "Sentiment": analysis["sentiment"],
