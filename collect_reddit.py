@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 # ── Config ────────────────────────────────────────────────────────────────────
 # Replace these with your actual keys
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
-AIRTABLE_KEY  = os.environ.get("AIRTABLE_KEY", "")
+AIRTABLE_KEY  = "pate0cjtAStonZujz.c5b94747862327703f86074e104139c0a8bf3be0e3e51d24ebf708c637653259"
 AIRTABLE_BASE = "appsxLPHnrJga3fGc"
 AIRTABLE_RAW  = "tbl6fFhubzyXgpv2K"
 
@@ -54,20 +54,20 @@ def normalize_neighborhood(raw):
     return CANONICAL.get(raw.lower().strip(), raw if raw in NEIGHBORHOODS else None)
 
 def fetch_reddit_posts():
-    query = " OR ".join(f'"{n}"' for n in NEIGHBORHOODS)
-    subreddits = ["seattle", "seattlewa", "udub"]
+    # Pull new posts directly — no search query, just the freshest posts
+    # Claude does the neighborhood + commercial filtering downstream
+    subreddits = ["seattle", "seattlewa", "ballard", "CapitolHillSeattle", "WestSeattle"]
     all_posts = []
     seen = set()
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "AgoraIQ/0.1 commercial-signals-research",
         "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
     }
 
     for sub in subreddits:
         try:
-            url = f"https://www.reddit.com/r/{sub}/search.json?q={requests.utils.quote(query)}&sort=new&limit=25&raw_json=1"
+            url = f"https://www.reddit.com/r/{sub}/new.json?limit=50"
             r = requests.get(url, headers=headers, timeout=15)
             if not r.ok:
                 print(f"  Reddit r/{sub} returned {r.status_code}")
@@ -94,18 +94,36 @@ def fetch_reddit_posts():
     print(f"Fetched {len(all_posts)} posts from Reddit")
     return all_posts
 
-def already_saved(post_url):
-    formula = f'{{Source URL}}="{post_url}"'
+def fetch_saved_urls():
+    """Load all recently saved URLs in one batch call instead of 100 individual checks."""
+    saved_urls = set()
+    offset = None
     try:
-        r = requests.get(
-            f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_RAW}",
-            headers={"Authorization": f"Bearer {AIRTABLE_KEY}"},
-            params={"filterByFormula": formula, "pageSize": 1},
-            timeout=15
-        )
-        return len(r.json().get("records", [])) > 0
-    except:
-        return False
+        while True:
+            params = {
+                "fields[]": "Source URL",
+                "pageSize": 100,
+                "filterByFormula": 'IS_AFTER({Date}, DATEADD(TODAY(), -14, "days"))'
+            }
+            if offset:
+                params["offset"] = offset
+            r = requests.get(
+                f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_RAW}",
+                headers={"Authorization": f"Bearer {AIRTABLE_KEY}"},
+                params=params,
+                timeout=15
+            )
+            data = r.json()
+            for record in data.get("records", []):
+                url = record.get("fields", {}).get("Source URL")
+                if url:
+                    saved_urls.add(url)
+            offset = data.get("offset")
+            if not offset:
+                break
+    except Exception as e:
+        print(f"  Warning: could not load saved URLs: {e}")
+    return saved_urls
 
 def analyze_with_claude(post):
     neighborhoods_str = ", ".join(NEIGHBORHOODS)
@@ -150,10 +168,12 @@ Return ONLY valid JSON:
     if not r.ok:
         raise Exception(f"Claude API error: {r.status_code}")
 
-    text = r.json()["content"][0]["text"].replace("```json", "").replace("```", "").strip()
-    # Find JSON object in response
-    start = text.find('{')
-    end = text.rfind('}') + 1
+    text = r.json()["content"][0]["text"]
+    # Extract JSON object robustly
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start == -1 or end == 0:
+        raise Exception("No JSON found in Claude response")
     result = json.loads(text[start:end])
     if result.get("neighborhood"):
         result["neighborhood"] = normalize_neighborhood(result["neighborhood"])
@@ -176,7 +196,7 @@ def save_to_airtable(post, analysis):
             "Date": post["date"], "Raw Signal": post["description"],
             "Category": analysis["category"], "Sentiment": analysis["sentiment"],
             "Intent Summary": analysis["summary"], "Forward Signal": analysis.get("forward_signal", ""),
-            "Source URL": post["url"], "Neighborhoods": analysis["neighborhood"],
+            "Source URL": post["url"], "Neighborhood": analysis["neighborhood"],
             "Week": get_week_key(), "ingestion_timestamp": datetime.now(timezone.utc).isoformat(),
             "comment_count_initial": post["comments"], "source_type": "reddit",
         }, "typecast": True},
@@ -189,15 +209,19 @@ def run():
     print(f"\n=== AgoraIQ Reddit Collection — {datetime.now(timezone.utc).isoformat()} ===")
     posts = fetch_reddit_posts()
     if not posts:
-        print("No posts fetched.")
+        print("No posts fetched. Exiting.")
         return
+
+    print("  Loading saved URLs from Airtable...")
+    saved_urls = fetch_saved_urls()
+    print(f"  {len(saved_urls)} URLs already in database")
 
     saved = skipped = 0
     discarded = {}
 
     for post in posts:
         try:
-            if already_saved(post["url"]):
+            if post["url"] in saved_urls:
                 skipped += 1
                 continue
             analysis = analyze_with_claude(post)
@@ -206,6 +230,7 @@ def run():
                 discarded[reason] = discarded.get(reason, 0) + 1
                 continue
             save_to_airtable(post, analysis)
+            saved_urls.add(post["url"])
             saved += 1
             print(f"  + [{analysis['category']}] {analysis['neighborhood']}: {analysis['summary'][:60]}")
             time.sleep(1.5)
