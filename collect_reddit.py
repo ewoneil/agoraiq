@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 # ── Config ────────────────────────────────────────────────────────────────────
 # Replace these with your actual keys
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
-AIRTABLE_KEY  = "pate0cjtAStonZujz.c5b94747862327703f86074e104139c0a8bf3be0e3e51d24ebf708c637653259"
+AIRTABLE_KEY = os.environ.get("AIRTABLE_KEY", "")
 AIRTABLE_BASE = "appsxLPHnrJga3fGc"
 AIRTABLE_RAW  = "tbl6fFhubzyXgpv2K"
 
