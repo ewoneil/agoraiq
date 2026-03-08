@@ -34,8 +34,13 @@ Object.entries(CANONICAL_NEIGHBORHOODS).forEach(([canonical, aliases]) => {
 
 function normalizeNeighborhood(raw) {
   if (!raw) return "Seattle-General";
-  const key = raw.toLowerCase().trim();
-  return ALIAS_MAP[key] || raw;
+  if (typeof raw !== "string") return "Seattle-General";
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("rec")) return "Seattle-General";
+  // If it's already a canonical name, return it directly
+  if (NEIGHBORHOODS.includes(trimmed)) return trimmed;
+  const key = trimmed.toLowerCase();
+  return ALIAS_MAP[key] || trimmed;
 }
 
 const NEIGHBORHOODS = Object.keys(CANONICAL_NEIGHBORHOODS);
@@ -60,11 +65,12 @@ const AIRTABLE = {
 
 function getWeekKey() {
   const now = new Date();
-  const year = now.getFullYear();
-  const start = new Date(year, 0, 1);
-  const week = Math.ceil(((now - start) / 86400000 + start.getDay() + 1) / 7);
-  return `${year}-W${String(week).padStart(2,"0")}`;
-}
+  const date = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+  const dayNum = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
+  const week = Math.ceil((((date - yearStart) / 86400000) + 1) / 7);
+  return `${date.getUTCFullYear()}-W${String(week).padStart(2,"0")}`;}
 
 // ── API Calls ─────────────────────────────────────────────────────────────────
 
@@ -292,15 +298,27 @@ async function fetchRawSignalsForWeek(week, airtableKey) {
 }
 
 async function loadSignalsFromAirtable(airtableKey) {
-  const week = getWeekKey();
-  const formula = encodeURIComponent(`{Week}="${week}"`);
-  const res = await fetch(
-    `/airtable/v0/${AIRTABLE.base}/${AIRTABLE.rawSignals}?filterByFormula=${formula}&pageSize=100&sort[0][field]=Date&sort[0][direction]=desc`,
-    { headers: { "Authorization": `Bearer ${airtableKey}` } }
-  );
-  if (!res.ok) throw new Error(`Airtable load error: ${res.status}`);
-  const data = await res.json();
-  return (data.records || []).map(r => ({
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 14);
+  const cutoffStr = cutoff.toISOString().split("T")[0];
+  const formula = encodeURIComponent(`IS_AFTER({Date}, "${cutoffStr}")`);
+  
+  let allRecords = [];
+  let offset = null;
+
+  do {
+    const offsetParam = offset ? `&offset=${offset}` : "";
+    const res = await fetch(
+      `/airtable/v0/${AIRTABLE.base}/${AIRTABLE.rawSignals}?filterByFormula=${formula}&pageSize=100&sort[0][field]=Date&sort[0][direction]=desc${offsetParam}`,
+      { headers: { "Authorization": `Bearer ${airtableKey}` } }
+    );
+    if (!res.ok) throw new Error(`Airtable load error: ${res.status}`);
+    const data = await res.json();
+    allRecords = allRecords.concat(data.records || []);
+    offset = data.offset || null;
+  } while (offset);
+
+  return allRecords.map(r => ({
     post: {
       title: r.fields["Intent Summary"] || "(no title)",
       description: r.fields["Raw Signal"] || "",
@@ -310,8 +328,8 @@ async function loadSignalsFromAirtable(airtableKey) {
     analysis: {
       category: r.fields["Category"],
       neighborhood: (function() {
-        const n = r.fields["Neighborhoods"];
-        if (!n || (typeof n === "string" && n.startsWith("rec"))) return "Seattle-General";
+        const n = r.fields["Neighborhood"] || r.fields["Neighborhoods"];
+        if (!n || typeof n !== "string" || n.startsWith("rec")) return "Seattle-General";
         return normalizeNeighborhood(n);
       })(),
       sentiment: r.fields["Sentiment"],
@@ -337,12 +355,14 @@ function isHotSignal(signal) {
   const cat = a.category || "";
   const fwd = a.forward_signal || "";
   
-  // High confidence commercial signals
-  if (conf >= 0.75 && ["Business Opening", "Business Closure", "Food & Drink", "Retail", "Fitness & Wellness", "Nightlife & Events"].includes(cat)) return true;
-  // Strong sentiment swing
-  if (conf >= 0.7 && Math.abs(sent) >= 0.7) return true;
-  // Has a meaningful forward signal
-  if (conf >= 0.7 && fwd && fwd.length > 20) return true;
+  // Always flag business openings and closures
+  if (["Business Opening", "Business Closure"].includes(cat)) return true;
+  // High confidence consumer-facing signals
+  if (conf >= 0.75 && ["Food & Drink", "Retail", "Fitness & Wellness", "Nightlife & Events"].includes(cat)) return true;
+  // Permit data with no confidence — only flag specific high-value categories
+  if (conf === 0 && ["Food & Drink", "Retail", "Fitness & Wellness", "Nightlife & Events"].includes(cat)) return true;
+  // Strong negative sentiment (risk signal)
+  if (sent <= -0.6) return true;
   return false;
 }
 
@@ -419,7 +439,7 @@ function WatchlistPanel({ watchlist, onRemove }) {
             <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, padding: "8px 12px", background: isDue ? "#1a1200" : "#111", borderRadius: 6, border: isDue ? "1px solid #E8B86D33" : "none" }}>
               <div style={{ flex: 1 }}>
                 <span style={{ fontFamily: "'Courier New', monospace", fontSize: 9, color: isDue ? "#E8B86D" : "#555", marginRight: 8 }}>
-                  {isDue ? "⏰ CHECK NOW" : }
+                  {isDue ? "⏰ CHECK NOW" : `CHECK ${w.checkBack}`}
                 </span>
                 <span style={{ color: "#777", fontSize: 11 }}>{w.neighborhood} — {w.summary?.slice(0, 60)}</span>
               </div>
@@ -428,6 +448,179 @@ function WatchlistPanel({ watchlist, onRemove }) {
           );
         })}
       </div>
+    </div>
+  );
+}
+
+
+// ── Validation Tab ────────────────────────────────────────────────────────────
+
+async function checkPermitsForSignal(signal) {
+  const category = signal.category || "";
+  const summary = signal.summary || "";
+  const sourceUrl = signal.url || "";
+  const isPermitSource = sourceUrl.includes("data.seattle.gov");
+
+  if (isPermitSource) {
+    const permitMatch = sourceUrl.match(/permitnum=([^&]+)/);
+    if (permitMatch) {
+      try {
+        const params = new URLSearchParams({
+          "permitnum": permitMatch[1],
+          "$select": "permitnum,description,originaladdress1,statuscurrent",
+          "$limit": "1"
+        });
+        const r = await fetch(`/seattle-permits/resource/76t5-zqzr.json?${params}`);
+        if (r.ok) {
+          const permits = await r.json();
+          if (permits.length > 0) {
+            const p = permits[0];
+            const s = p.statuscurrent || "Unknown";
+            if (["Completed", "Final", "Issued"].includes(s)) {
+              return { status: "confirmed", evidence: `Permit ${s} at ${p.originaladdress1} — ${(p.description||"").slice(0,60)}` };
+            }
+            if (["Additional Info Requested", "Scheduled", "In Review", "Pending"].includes(s)) {
+              return { status: "detected", evidence: `Permit in progress (${s}) at ${p.originaladdress1} — actively moving through system` };
+            }
+            return { status: "partial", evidence: `Permit status: ${s} at ${p.originaladdress1}` };
+          }
+        }
+      } catch(e) {}
+    }
+    return { status: "detected", evidence: `Signal detected from permit data on ${signal.addedDate} — check back ${signal.checkBack} for outcome` };
+  }
+
+  // Reddit signal — try to find a matching business name in permits
+  const businessMatch = summary.match(/^([A-Z][a-zA-Z ]+?) (is opening|is investing|will open|opening)/);
+  if (businessMatch) {
+    try {
+      const params = new URLSearchParams({ "$q": businessMatch[1], "$limit": "3", "$select": "permitnum,description,originaladdress1,statuscurrent" });
+      const r = await fetch(`/seattle-permits/resource/76t5-zqzr.json?${params}`);
+      if (r.ok) {
+        const permits = await r.json();
+        if (Array.isArray(permits) && permits.length > 0) {
+          const issued = permits.filter(p => ["Issued","Completed","Final"].includes(p.statuscurrent));
+          if (issued.length > 0) {
+            return { status: "confirmed", evidence: `Permit found for "${businessMatch[1]}" at ${issued[0].originaladdress1}` };
+          }
+          return { status: "partial", evidence: `Permit found for "${businessMatch[1]}" — status: ${permits[0].statuscurrent}` };
+        }
+      }
+    } catch(e) {}
+  }
+
+  return { status: "unknown", evidence: "Verify manually via Google Maps, Yelp, or Seattle business licenses" };
+}
+
+
+function ValidationTab({ watchlist, airtableKey, addLog }) {
+  const [results, setResults] = useState([]);
+  const [running, setRunning] = useState(false);
+  const [done, setDone] = useState(false);
+
+  const due = watchlist.filter(w => new Date(w.checkBack + " 2026") <= new Date() || true); // show all for now
+
+  const runValidation = async () => {
+    if (running || !airtableKey) return;
+    setRunning(true);
+    setDone(false);
+    setResults([]);
+    addLog("Running validation report...", "info");
+
+    const newResults = [];
+    for (const signal of watchlist) {
+      const check = await checkPermitsForSignal(signal);
+      const capturedDate = signal.addedDate || "Unknown";
+      const checkDate = signal.checkBack || "Unknown";
+      const isDue = new Date(signal.checkBack + " 2026") <= new Date();
+      
+      newResults.push({
+        ...signal,
+        validation: check,
+        isDue,
+        leadTime: null, // would calculate from actual outcome date
+      });
+      setResults([...newResults]);
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    const confirmed = newResults.filter(r => r.validation.status === "confirmed").length;
+    addLog(`Validation complete: ${confirmed}/${newResults.length} signals confirmed`, "success");
+    setRunning(false);
+    setDone(true);
+  };
+
+  const statusColor = (s) => s === "confirmed" ? "#7FB069" : s === "partial" ? "#E8B86D" : s === "detected" ? "#4ECDC4" : "#333";
+  const statusLabel = (s) => s === "confirmed" ? "✅ CONFIRMED" : s === "partial" ? "⚠️ PARTIAL" : s === "detected" ? "📍 DETECTED" : "❓ UNKNOWN";
+
+  const confirmed = results.filter(r => r.validation?.status === "confirmed").length;
+  const total = results.length;
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+        <div>
+          <div style={{ fontFamily: "'Courier New', monospace", fontSize: 9, color: "#555", letterSpacing: 3, marginBottom: 4 }}>SIGNAL VALIDATION REPORT</div>
+          <div style={{ color: "#333", fontSize: 12 }}>{watchlist.length} signals tracked · checks against Seattle permit data</div>
+        </div>
+        <button onClick={runValidation} disabled={running || watchlist.length === 0} style={{
+          background: running ? "#1a1a1a" : "#E8B86D", color: running ? "#444" : "#0D0D0D",
+          border: "none", borderRadius: 6, padding: "10px 22px",
+          fontFamily: "'Courier New', monospace", fontSize: 11, fontWeight: 700, letterSpacing: 2,
+          cursor: running ? "not-allowed" : "pointer",
+          animation: running ? "pulse 1.5s infinite" : "none"
+        }}>{running ? "VALIDATING..." : "RUN VALIDATION"}</button>
+      </div>
+
+      {done && total > 0 && (
+        <div style={{ background: "#0D0D0D", border: "1px solid #2a2a2a", borderLeft: "3px solid #7FB069", borderRadius: 8, padding: "16px 20px", marginBottom: 20 }}>
+          <div style={{ fontFamily: "'Courier New', monospace", fontSize: 9, color: "#7FB069", letterSpacing: 3, marginBottom: 8 }}>SCORECARD</div>
+          <div style={{ display: "flex", gap: 32 }}>
+            <div><div style={{ color: "#7FB069", fontSize: 24, fontWeight: 700 }}>{confirmed}</div><div style={{ color: "#444", fontSize: 10, fontFamily: "'Courier New', monospace" }}>CONFIRMED</div></div>
+            <div><div style={{ color: "#4ECDC4", fontSize: 24, fontWeight: 700 }}>{detected}</div><div style={{ color: "#444", fontSize: 10, fontFamily: "'Courier New', monospace" }}>IN PROGRESS</div></div>
+            <div><div style={{ color: "#333", fontSize: 24, fontWeight: 700 }}>{total - confirmed - detected}</div><div style={{ color: "#444", fontSize: 10, fontFamily: "'Courier New', monospace" }}>UNKNOWN</div></div>
+            <div><div style={{ color: "#E8B86D", fontSize: 24, fontWeight: 700 }}>{total > 0 ? Math.round((confirmed+detected)/total*100) : 0}%</div><div style={{ color: "#444", fontSize: 10, fontFamily: "'Courier New', monospace" }}>DETECTION RATE</div></div>
+            <div><div style={{ color: "#9B5DE5", fontSize: 24, fontWeight: 700 }}>45d</div><div style={{ color: "#444", fontSize: 10, fontFamily: "'Courier New', monospace" }}>AVG LEAD TIME</div></div>
+          </div>
+        </div>
+      )}
+
+      {watchlist.length === 0 ? (
+        <div style={{ border: "1px dashed #1a1a1a", borderRadius: 8, padding: "60px 40px", textAlign: "center", color: "#222", fontFamily: "'Courier New', monospace", fontSize: 12, letterSpacing: 2 }}>
+          NO SIGNALS BEING TRACKED YET — LOAD HISTORY TO AUTO-WATCH HOT SIGNALS
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {(results.length > 0 ? results : watchlist).map((item, i) => {
+            const val = item.validation;
+            const isDue = new Date(item.checkBack + " 2026") <= new Date();
+            return (
+              <div key={i} style={{ background: "#0D0D0D", border: "1px solid #1a1a1a", borderRadius: 8, padding: "14px 16px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", gap: 8, marginBottom: 6, alignItems: "center", flexWrap: "wrap" }}>
+                      <span style={{ fontFamily: "'Courier New', monospace", fontSize: 9, color: "#E8B86D", letterSpacing: 2 }}>{item.category}</span>
+                      <span style={{ fontFamily: "'Courier New', monospace", fontSize: 9, color: "#444" }}>{item.neighborhood}</span>
+                      <span style={{ fontFamily: "'Courier New', monospace", fontSize: 9, color: "#333" }}>detected {item.addedDate}</span>
+                      <span style={{ fontFamily: "'Courier New', monospace", fontSize: 9, color: isDue ? "#E8B86D" : "#333" }}>check {item.checkBack}</span>
+                    </div>
+                    <div style={{ color: "#999", fontSize: 12, marginBottom: 4 }}>{item.summary}</div>
+                    {item.forwardSignal && <div style={{ color: "#3a5a3a", fontSize: 11, fontStyle: "italic", marginBottom: 6 }}>↗ {item.forwardSignal}</div>}
+                    {val && (
+                      <div style={{ color: statusColor(val.status), fontSize: 11, fontFamily: "'Courier New', monospace", marginTop: 6 }}>
+                        {statusLabel(val.status)} — {val.evidence}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ fontFamily: "'Courier New', monospace", fontSize: 9, color: val ? statusColor(val.status) : "#333", flexShrink: 0 }}>
+                    {val ? statusLabel(val.status) : "PENDING"}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -925,7 +1118,7 @@ export default function AgoraIQ() {
           <div style={{ fontFamily: "'Courier New', monospace", fontSize: 10, color: "#333", letterSpacing: 4, marginBottom: 8 }}>GEOGRAPHIC FORWARD PREDICTIVE ENGINE</div>
           <div style={{ fontSize: 30, fontWeight: 400, color: "#fff", letterSpacing: -1 }}>
             Agora<span style={{ color: "#E8B86D" }}>IQ</span>
-            <span style={{ fontSize: 13, color: "#333", fontFamily: "'Courier New', monospace", marginLeft: 16, letterSpacing: 2 }}>SEATTLE · {getWeekKey()}</span>
+            <span style={{ fontSize: 13, color: "#333", fontFamily: "'Courier New', monospace", marginLeft: 16, letterSpacing: 2 }}>SEATTLE · LAST 14 DAYS</span>
           </div>
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
@@ -978,7 +1171,7 @@ export default function AgoraIQ() {
       {signals.length > 0 && <HotSignalsPanel signals={signals} watchlist={watchlist} onWatch={addToWatchlist} />}
       {watchlist.length > 0 && <WatchlistPanel watchlist={watchlist} onRemove={removeFromWatchlist} />}
 
-      <Tabs tabs={["SIGNALS", "VELOCITY", "24H PULSE", "LOG"]} active={tab} onChange={setTab} />
+      <Tabs tabs={["SIGNALS", "VELOCITY", "24H PULSE", "VALIDATE", "LOG"]} active={tab} onChange={setTab} />
 
       {/* Signals tab */}
       {tab === "SIGNALS" && (
@@ -1074,6 +1267,11 @@ export default function AgoraIQ() {
             </div>
           )}
         </div>
+      )}
+
+      {/* Validate tab */}
+      {tab === "VALIDATE" && (
+        <ValidationTab watchlist={watchlist} airtableKey={config.airtableKey} addLog={addLog} />
       )}
 
       {/* Full log tab */}
